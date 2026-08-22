@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     #--------. env---------------
     SERVICE_NAME: str
     STORAGE_PATH: str
+    STORAGE_DECODED_PATH: str
     #----------------------------
 
 
