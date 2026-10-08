@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
@@ -47,26 +48,47 @@ class StreamFilesService(IStreamFilesService):
     async def _stream_file_worker(self, file_name: str, file_path: Path, partition: int) -> None:
         """Read file line by line and route directly to the designated partition."""
         topic = settings.MAIN_TOPIC_NAME
-
         try:
             async with aiofiles.open(file_path, mode="r", encoding="utf-8") as f:
-                async for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+                while True:
+                    previous_time: datetime | None = None   
+                    async for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        frame_data = json.loads(line)
+                        drone_id = frame_data.get(StreamMessages.DRONE_ID_KEY, file_name)
 
-                    frame_data = json.loads(line)
-                    drone_id = frame_data.get(StreamMessages.DRONE_ID_KEY, file_name)
+                        # getting the PTS from the packet
+                        pts_raw = frame_data.get(StreamMessages.PTS_KEY)
+                        pts = datetime.fromisoformat(pts_raw) if pts_raw else None
 
-                    message = KafkaMessageDTO(
-                        topic=topic,
-                        value=frame_data,
-                        key=drone_id,
-                        partition=partition,
-                    )
-                    await self._producer.send_message(message)
+                        # calc the time to await
+                        if previous_time is not None and pts is not None:
+                            await_time = (pts - previous_time).total_seconds()
+                            
+                            if 0 < await_time < 1.0:
+                                await asyncio.sleep(await_time)
+                            elif await_time < 0 or await_time >= 1.0:
+                                logger.warning(StreamMessages.NOT_VALID_PTS_DIFF.format(await_time))
+                        
+                        if pts is not None:
+                            previous_time = pts
+                        # chaning the UTC to current utc
+                        frame_data[StreamMessages.CURRENT_PTS_KEY] = datetime.now(timezone.utc).isoformat()
+                        message = KafkaMessageDTO(
+                            topic=topic,
+                            value=frame_data,
+                            key=drone_id,
+                            partition=partition,
+                        )
+                        await self._producer.send_message(message)
 
-            logger.info(StreamMessages.STREAM_COMPLETED.format(file_name))
+                    logger.info(StreamMessages.SENDING_IN_LOOP.format(file_name))
+                    await f.seek(0)
+                    previous_time = None
+
         except asyncio.CancelledError:
             logger.info(StreamMessages.STREAM_STOPPED.format(file_name))
             raise
